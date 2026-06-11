@@ -5,6 +5,9 @@ import express from "express";
 import path from "path";
 
 import authRoutes from "./features/auth/auth.route";
+import customerRoutes from "./features/customers/customer.route";
+import paymentRoutes from "./features/payments/payment.route";
+import planRoutes from "./features/plans/plan.route";
 import storeRoutes from "./features/stores/store.route";
 import { env } from "./utils/env";
 
@@ -20,6 +23,9 @@ app.get("/health", (_req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use("/api/stores", storeRoutes);
+app.use("/api/plans", planRoutes);
+app.use("/api/customers", customerRoutes);
+app.use("/api/payments", paymentRoutes);
 
 app.listen(env.port, () => {
   console.log(`Server is running on port ${env.port}`);
