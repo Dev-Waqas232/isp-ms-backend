@@ -1,4 +1,4 @@
-import { and, eq, gte, lt } from "drizzle-orm";
+import { and, eq, gte, lt, sql } from "drizzle-orm";
 
 import { db } from "../../db/config";
 import { billingPeriods, customers, paymentAllocations, payments, stores } from "../../db/schema";
@@ -23,72 +23,74 @@ export async function getAdminStore(adminId: string) {
 }
 
 export async function recordPayment(payload: RecordPaymentPayload) {
-  const customer = await db.query.customers.findFirst({
-    where: and(eq(customers.storeId, payload.storeId), eq(customers.id, payload.customerId)),
-  });
-
-  if (!customer) {
-    throw new Error("CUSTOMER_NOT_FOUND");
-  }
-
-  await ensureBillingPeriodsForCustomer(customer.id);
-
-  const [payment] = await db.insert(payments).values({
-    storeId: payload.storeId,
-    customerId: payload.customerId,
-    amount: payload.amount,
-    unappliedAmount: payload.amount,
-    method: payload.method,
-    paidAt: payload.paidAt,
-    reference: payload.reference?.trim() || null,
-    notes: payload.notes?.trim() || null,
-  }).returning();
-
-  let remaining = payload.amount;
-  const unpaidPeriods = await db.query.billingPeriods.findMany({
-    where: and(eq(billingPeriods.customerId, customer.id), eq(billingPeriods.storeId, payload.storeId)),
-    orderBy: (table, { asc }) => [asc(table.periodStart)],
-  });
-
-  for (const period of unpaidPeriods.filter(period => period.balance > 0)) {
-    if (remaining <= 0) break;
-
-    const allocationAmount = Math.min(remaining, period.balance);
-    const amountPaid = period.amountPaid + allocationAmount;
-    const balance = period.amountDue - amountPaid;
-
-    await db.insert(paymentAllocations).values({
-      paymentId: payment.id,
-      billingPeriodId: period.id,
-      amount: allocationAmount,
+  return db.transaction(async (tx) => {
+    const customer = await tx.query.customers.findFirst({
+      where: and(eq(customers.storeId, payload.storeId), eq(customers.id, payload.customerId)),
     });
-    await db.update(billingPeriods).set({
-      amountPaid,
-      balance,
-      status: balance <= 0 ? "paid" : "partial",
+
+    if (!customer) {
+      throw new Error("CUSTOMER_NOT_FOUND");
+    }
+
+    await ensureBillingPeriodsForCustomer(customer.id, tx);
+
+    const [payment] = await tx.insert(payments).values({
+      storeId: payload.storeId,
+      customerId: payload.customerId,
+      amount: payload.amount,
+      unappliedAmount: payload.amount,
+      method: payload.method,
+      paidAt: payload.paidAt,
+      reference: payload.reference?.trim() || null,
+      notes: payload.notes?.trim() || null,
+    }).returning();
+
+    let remaining = payload.amount;
+    const unpaidPeriods = await tx.query.billingPeriods.findMany({
+      where: and(eq(billingPeriods.customerId, customer.id), eq(billingPeriods.storeId, payload.storeId)),
+      orderBy: (table, { asc }) => [asc(table.periodStart)],
+    });
+
+    for (const period of unpaidPeriods.filter(period => period.balance > 0)) {
+      if (remaining <= 0) break;
+
+      const allocationAmount = Math.min(remaining, period.balance);
+      const amountPaid = period.amountPaid + allocationAmount;
+      const balance = period.amountDue - amountPaid;
+
+      await tx.insert(paymentAllocations).values({
+        paymentId: payment.id,
+        billingPeriodId: period.id,
+        amount: allocationAmount,
+      });
+      await tx.update(billingPeriods).set({
+        amountPaid,
+        balance,
+        status: balance <= 0 ? "paid" : "partial",
+        updatedAt: new Date(),
+      }).where(eq(billingPeriods.id, period.id));
+
+      remaining -= allocationAmount;
+    }
+
+    await tx.update(payments).set({
+      unappliedAmount: remaining,
       updatedAt: new Date(),
-    }).where(eq(billingPeriods.id, period.id));
+    }).where(eq(payments.id, payment.id));
 
-    remaining -= allocationAmount;
-  }
+    if (remaining > 0) {
+      await tx.update(customers).set({
+        creditBalance: sql`${customers.creditBalance} + ${remaining}`,
+        updatedAt: new Date(),
+      }).where(eq(customers.id, customer.id));
+    }
 
-  await db.update(payments).set({
-    unappliedAmount: remaining,
-    updatedAt: new Date(),
-  }).where(eq(payments.id, payment.id));
+    await refreshBillingStatuses(customer.id, tx);
 
-  if (remaining > 0) {
-    await db.update(customers).set({
-      creditBalance: customer.creditBalance + remaining,
-      updatedAt: new Date(),
-    }).where(eq(customers.id, customer.id));
-  }
-
-  await refreshBillingStatuses(customer.id);
-
-  return db.query.payments.findFirst({
-    where: eq(payments.id, payment.id),
-    with: { allocations: true },
+    return tx.query.payments.findFirst({
+      where: eq(payments.id, payment.id),
+      with: { allocations: true },
+    });
   });
 }
 

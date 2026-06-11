@@ -49,8 +49,9 @@ function getBillingStatus(balance: number, amountPaid: number, periodEnd: string
   return "pending";
 }
 
-async function applyCreditToPeriod(customerId: string, periodId: string, amountDue: number) {
-  const customer = await db.query.customers.findFirst({
+async function applyCreditToPeriod(customerId: string, periodId: string, amountDue: number, tx?: any) {
+  const client = tx || db;
+  const customer = await client.query.customers.findFirst({
     where: eq(customers.id, customerId),
   });
 
@@ -61,18 +62,22 @@ async function applyCreditToPeriod(customerId: string, periodId: string, amountD
   const creditToApply = Math.min(customer.creditBalance, amountDue);
   const balance = amountDue - creditToApply;
 
-  await db.update(billingPeriods)
+  const currentPeriod = await client.query.billingPeriods.findFirst({
+    where: eq(billingPeriods.id, periodId)
+  });
+
+  await client.update(billingPeriods)
     .set({
       amountPaid: creditToApply,
       balance,
-      status: getBillingStatus(balance, creditToApply, (await db.query.billingPeriods.findFirst({ where: eq(billingPeriods.id, periodId) }))?.periodEnd ?? todayString()),
+      status: getBillingStatus(balance, creditToApply, currentPeriod?.periodEnd ?? todayString()),
       updatedAt: new Date(),
     })
     .where(eq(billingPeriods.id, periodId));
 
-  await db.update(customers)
+  await client.update(customers)
     .set({
-      creditBalance: customer.creditBalance - creditToApply,
+      creditBalance: sql`${customers.creditBalance} - ${creditToApply}`,
       updatedAt: new Date(),
     })
     .where(eq(customers.id, customerId));
@@ -84,9 +89,10 @@ async function createBillingPeriod(payload: {
   planId: string;
   periodStart: string;
   amountDue: number;
-}) {
+}, tx?: any) {
+  const client = tx || db;
   const periodEnd = addDays(payload.periodStart, 30);
-  const [period] = await db.insert(billingPeriods).values({
+  const [period] = await client.insert(billingPeriods).values({
     storeId: payload.storeId,
     customerId: payload.customerId,
     planId: payload.planId,
@@ -98,13 +104,14 @@ async function createBillingPeriod(payload: {
     status: getBillingStatus(payload.amountDue, 0, periodEnd),
   }).returning();
 
-  await applyCreditToPeriod(payload.customerId, period.id, payload.amountDue);
+  await applyCreditToPeriod(payload.customerId, period.id, payload.amountDue, tx);
 
   return period;
 }
 
-export async function ensureBillingPeriodsForCustomer(customerId: string) {
-  const customer = await db.query.customers.findFirst({
+export async function ensureBillingPeriodsForCustomer(customerId: string, tx?: any) {
+  const client = tx || db;
+  const customer = await client.query.customers.findFirst({
     where: eq(customers.id, customerId),
     with: { plan: true },
   });
@@ -113,22 +120,28 @@ export async function ensureBillingPeriodsForCustomer(customerId: string) {
     return;
   }
 
-  const existingLatest = await db.query.billingPeriods.findFirst({
+  const existingLatest = await client.query.billingPeriods.findFirst({
     where: eq(billingPeriods.customerId, customer.id),
-    orderBy: (table, { desc }) => [desc(table.periodStart)],
+    orderBy: (table: any, { desc }: any) => [desc(table.periodStart)],
   });
 
-  let latestPeriod: BillingPeriodRow = existingLatest ?? await createBillingPeriod({
-    storeId: customer.storeId,
-    customerId: customer.id,
-    planId: customer.planId,
-    periodStart: customer.activationDate,
-    amountDue: customer.plan.price,
-  });
+  let latestPeriod: BillingPeriodRow;
+  if (!existingLatest || existingLatest.periodEnd <= customer.activationDate) {
+    const alreadyExists = existingLatest && existingLatest.periodStart === customer.activationDate;
+    latestPeriod = alreadyExists ? existingLatest : await createBillingPeriod({
+      storeId: customer.storeId,
+      customerId: customer.id,
+      planId: customer.planId,
+      periodStart: customer.activationDate,
+      amountDue: customer.plan.price,
+    }, tx);
+  } else {
+    latestPeriod = existingLatest;
+  }
 
   while (latestPeriod.periodEnd <= todayString()) {
     const nextStart: string = latestPeriod.periodEnd;
-    const existing: BillingPeriodRow | undefined = await db.query.billingPeriods.findFirst({
+    const existing: BillingPeriodRow | undefined = await client.query.billingPeriods.findFirst({
       where: and(eq(billingPeriods.customerId, customer.id), eq(billingPeriods.periodStart, nextStart)),
     });
 
@@ -138,18 +151,19 @@ export async function ensureBillingPeriodsForCustomer(customerId: string) {
       planId: customer.planId,
       periodStart: nextStart,
       amountDue: customer.plan.price,
-    });
+    }, tx);
   }
 
-  await refreshBillingStatuses(customer.id);
+  await refreshBillingStatuses(customer.id, tx);
 }
 
-export async function refreshBillingStatuses(customerId: string) {
-  const periods = await db.query.billingPeriods.findMany({
+export async function refreshBillingStatuses(customerId: string, tx?: any) {
+  const client = tx || db;
+  const periods = await client.query.billingPeriods.findMany({
     where: eq(billingPeriods.customerId, customerId),
   });
 
-  await Promise.all(periods.map(period => db.update(billingPeriods).set({
+  await Promise.all(periods.map((period: any) => client.update(billingPeriods).set({
     status: getBillingStatus(period.balance, period.amountPaid, period.periodEnd),
     updatedAt: new Date(),
   }).where(eq(billingPeriods.id, period.id))));
@@ -267,13 +281,30 @@ export async function getCustomerById(storeId: string, customerId: string) {
 }
 
 export async function updateCustomer(storeId: string, customerId: string, payload: UpdateCustomerPayload) {
+  const currentCustomer = await db.query.customers.findFirst({
+    where: and(eq(customers.storeId, storeId), eq(customers.id, customerId)),
+  });
+
+  if (!currentCustomer) {
+    return null;
+  }
+
+  let activationDate = payload.activationDate;
+  let expirationDate = payload.activationDate !== undefined ? addDays(payload.activationDate, 30) : undefined;
+
+  if (payload.status === "active" && currentCustomer.status === "inactive") {
+    const today = new Date().toISOString().slice(0, 10);
+    activationDate = activationDate ?? today;
+    expirationDate = addDays(activationDate, 30);
+  }
+
   const [customer] = await db.update(customers).set({
     ...(payload.planId !== undefined ? { planId: payload.planId } : {}),
     ...(payload.name !== undefined ? { name: payload.name.trim() } : {}),
     ...(payload.username !== undefined ? { username: payload.username.trim() } : {}),
     ...(payload.phoneNumber !== undefined ? { phoneNumber: payload.phoneNumber.trim() } : {}),
     ...(payload.address !== undefined ? { address: payload.address?.trim() || null } : {}),
-    ...(payload.activationDate !== undefined ? { activationDate: payload.activationDate, expirationDate: addDays(payload.activationDate, 30) } : {}),
+    ...(activationDate !== undefined ? { activationDate, expirationDate } : {}),
     ...(payload.status !== undefined ? { status: payload.status } : {}),
     updatedAt: new Date(),
   }).where(and(eq(customers.storeId, storeId), eq(customers.id, customerId))).returning();

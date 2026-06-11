@@ -8,6 +8,9 @@ const cors_1 = __importDefault(require("cors"));
 const express_1 = __importDefault(require("express"));
 const path_1 = __importDefault(require("path"));
 const auth_route_1 = __importDefault(require("./features/auth/auth.route"));
+const customer_route_1 = __importDefault(require("./features/customers/customer.route"));
+const payment_route_1 = __importDefault(require("./features/payments/payment.route"));
+const plan_route_1 = __importDefault(require("./features/plans/plan.route"));
 const store_route_1 = __importDefault(require("./features/stores/store.route"));
 const env_1 = require("./utils/env");
 const app = (0, express_1.default)();
@@ -19,6 +22,9 @@ app.get("/health", (_req, res) => {
 });
 app.use("/api/auth", auth_route_1.default);
 app.use("/api/stores", store_route_1.default);
+app.use("/api/plans", plan_route_1.default);
+app.use("/api/customers", customer_route_1.default);
+app.use("/api/payments", payment_route_1.default);
 app.listen(env_1.env.port, () => {
     console.log(`Server is running on port ${env_1.env.port}`);
 });
